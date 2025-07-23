@@ -7,7 +7,6 @@
 
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
-#include "esphome/core/ring_buffer.h"
 
 #include "esphome/components/microphone/microphone.h"
 
@@ -49,19 +48,29 @@ class MicroWakeWord : public Component {
 #ifdef USE_MICRO_WAKE_WORD_VAD
   void add_vad_model(const uint8_t *model_start, uint8_t probability_cutoff, size_t sliding_window_size,
                      size_t tensor_arena_size);
+
+  // Intended for the voice assistant component to fetch VAD status
+  bool get_vad_state() { return this->vad_state_; }
 #endif
+
+  // Intended for the voice assistant component to know which wake words are available
+  // Since these are pointers to the WakeWordModel objects, the voice assistant component can enable or disable them
+  const std::vector<WakeWordModel *> &get_wake_words() const { return this->wake_word_models_; }
+
+  // Enables the wake word phrases given as strings in a vector. Disables any wake words not listed in the vector
+  // TODO: Should this logic be in the voice_assistant component?
+  void enable_wake_words(std::vector<std::string> &wake_words_to_enable);
 
  protected:
   microphone::Microphone *microphone_{nullptr};
   Trigger<std::string> *wake_word_detected_trigger_ = new Trigger<std::string>();
   State state_{State::IDLE};
 
-  std::unique_ptr<RingBuffer> features_ring_buffer_;
-
-  std::vector<WakeWordModel*> wake_word_models_;
+  std::vector<WakeWordModel *> wake_word_models_;
 
 #ifdef USE_MICRO_WAKE_WORD_VAD
   std::unique_ptr<VADModel> vad_model_;
+  bool vad_state_{false};
 #endif
 
   // Audio frontend handles generating spectrogram features
@@ -69,6 +78,11 @@ class MicroWakeWord : public Component {
   struct FrontendState frontend_state_;
 
   uint8_t features_step_size_;
+
+  /// @brief Suspends the preprocessor and inference tasks
+  void suspend_tasks_();
+  /// @brief Resumes the preprocessor and inference tasks
+  void resume_tasks_();
 
   void set_state_(State state);
 
@@ -90,6 +104,9 @@ class MicroWakeWord : public Component {
 
   // Used to send messages about the model's states to the main loop
   QueueHandle_t detection_queue_;
+
+  // Stores spectrogram features for inference
+  QueueHandle_t features_queue_;
 
   static void preprocessor_task_(void *params);
   TaskHandle_t preprocessor_task_handle_{nullptr};

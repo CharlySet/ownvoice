@@ -10,14 +10,14 @@ namespace nabu {
 
 static const size_t QUEUE_COUNT = 10;
 
-static const size_t HTTP_BUFFER_SIZE = 64 * 1024;
+static const size_t FILE_BUFFER_SIZE = 32 * 1024;
+static const size_t FILE_RING_BUFFER_SIZE = 64 * 1024;
 static const size_t BUFFER_SIZE_SAMPLES = 32768;
 static const size_t BUFFER_SIZE_BYTES = BUFFER_SIZE_SAMPLES * sizeof(int16_t);
 
 static const uint32_t READER_TASK_STACK_SIZE = 4096;
-static const uint32_t DECODER_TASK_STACK_SIZE = 4096;
-static const uint32_t RESAMPLER_TASK_STACK_SIZE = 4096;
-static const size_t DURATION_TASK_DELAY_MS = 10;
+static const uint32_t DECODER_TASK_STACK_SIZE = 3072;
+static const uint32_t RESAMPLER_TASK_STACK_SIZE = 3072;
 
 static const size_t INFO_ERROR_QUEUE_COUNT = 5;
 
@@ -91,7 +91,7 @@ esp_err_t AudioPipeline::start(media_player::MediaFile *media_file, uint32_t tar
 
 esp_err_t AudioPipeline::allocate_buffers_() {
   if (this->raw_file_ring_buffer_ == nullptr)
-    this->raw_file_ring_buffer_ = RingBuffer::create(HTTP_BUFFER_SIZE);
+    this->raw_file_ring_buffer_ = RingBuffer::create(FILE_RING_BUFFER_SIZE);
 
   if (this->decoded_ring_buffer_ == nullptr)
     this->decoded_ring_buffer_ = RingBuffer::create(BUFFER_SIZE_BYTES);
@@ -104,16 +104,14 @@ esp_err_t AudioPipeline::allocate_buffers_() {
     return ESP_ERR_NO_MEM;
   }
 
-  ExternalRAMAllocator<StackType_t> stack_allocator(ExternalRAMAllocator<StackType_t>::ALLOW_FAILURE);
-
   if (this->read_task_stack_buffer_ == nullptr)
-    this->read_task_stack_buffer_ = stack_allocator.allocate(READER_TASK_STACK_SIZE);
+    this->read_task_stack_buffer_ = (StackType_t *) malloc(READER_TASK_STACK_SIZE);
 
   if (this->decode_task_stack_buffer_ == nullptr)
-    this->decode_task_stack_buffer_ = stack_allocator.allocate(DECODER_TASK_STACK_SIZE);
+    this->decode_task_stack_buffer_ = (StackType_t *) malloc(DECODER_TASK_STACK_SIZE);
 
   if (this->resample_task_stack_buffer_ == nullptr)
-    this->resample_task_stack_buffer_ = stack_allocator.allocate(RESAMPLER_TASK_STACK_SIZE);
+    this->resample_task_stack_buffer_ = (StackType_t *) malloc(RESAMPLER_TASK_STACK_SIZE);
 
   if ((this->read_task_stack_buffer_ == nullptr) || (this->decode_task_stack_buffer_ == nullptr) ||
       (this->resample_task_stack_buffer_ == nullptr)) {
@@ -187,7 +185,7 @@ AudioPipelineState AudioPipeline::get_state() {
           if (event.err.has_value()) {
             ESP_LOGE(TAG, "Decoder encountered an error: %s", esp_err_to_name(event.err.value()));
           } else if (event.stream_info.has_value()) {
-            ESP_LOGD(TAG, "Decoded audio has %d channels, %d Hz sample rate, and %d bits per sample",
+            ESP_LOGD(TAG, "Decoded audio has %d channels, %" PRId32 " Hz sample rate, and %d bits per sample",
                      event.stream_info.value().channels, event.stream_info.value().sample_rate,
                      event.stream_info.value().bits_per_sample);
           }
@@ -271,6 +269,30 @@ void AudioPipeline::reset_ring_buffers() {
   this->resampled_ring_buffer_->reset();
 }
 
+void AudioPipeline::suspend_tasks() {
+  if (this->read_task_handle_ != nullptr) {
+    vTaskSuspend(this->read_task_handle_);
+  }
+  if (this->decode_task_handle_ != nullptr) {
+    vTaskSuspend(this->decode_task_handle_);
+  }
+  if (this->resample_task_handle_ != nullptr) {
+    vTaskSuspend(this->resample_task_handle_);
+  }
+}
+
+void AudioPipeline::resume_tasks() {
+  if (this->read_task_handle_ != nullptr) {
+    vTaskResume(this->read_task_handle_);
+  }
+  if (this->decode_task_handle_ != nullptr) {
+    vTaskResume(this->decode_task_handle_);
+  }
+  if (this->resample_task_handle_ != nullptr) {
+    vTaskResume(this->resample_task_handle_);
+  }
+}
+
 void AudioPipeline::read_task_(void *params) {
   AudioPipeline *this_pipeline = (AudioPipeline *) params;
 
@@ -292,7 +314,7 @@ void AudioPipeline::read_task_(void *params) {
       event.source = InfoErrorSource::READER;
       esp_err_t err = ESP_OK;
 
-      AudioReader reader = AudioReader(this_pipeline->raw_file_ring_buffer_.get(), HTTP_BUFFER_SIZE);
+      AudioReader reader = AudioReader(this_pipeline->raw_file_ring_buffer_.get(), FILE_BUFFER_SIZE);
 
       if (event_bits & READER_COMMAND_INIT_FILE) {
         err = reader.start(this_pipeline->current_media_file_, this_pipeline->current_media_file_type_);
@@ -332,9 +354,6 @@ void AudioPipeline::read_task_(void *params) {
                              EventGroupBits::READER_MESSAGE_ERROR | EventGroupBits::PIPELINE_COMMAND_STOP);
           break;
         }
-
-        // Block to give other tasks opportunity to run
-        delay(DURATION_TASK_DELAY_MS);
       }
     }
   }
@@ -360,7 +379,7 @@ void AudioPipeline::decode_task_(void *params) {
       event.source = InfoErrorSource::DECODER;
 
       std::unique_ptr<AudioDecoder> decoder = make_unique<AudioDecoder>(
-          this_pipeline->raw_file_ring_buffer_.get(), this_pipeline->decoded_ring_buffer_.get(), HTTP_BUFFER_SIZE);
+          this_pipeline->raw_file_ring_buffer_.get(), this_pipeline->decoded_ring_buffer_.get(), FILE_BUFFER_SIZE);
       esp_err_t err = decoder->start(this_pipeline->current_media_file_type_);
 
       if (err != ESP_OK) {
@@ -405,9 +424,6 @@ void AudioPipeline::decode_task_(void *params) {
           // Inform the resampler that the stream information is available
           xEventGroupSetBits(this_pipeline->event_group_, EventGroupBits::DECODER_MESSAGE_LOADED_STREAM_INFO);
         }
-
-        // Block to give other tasks opportunity to run
-        delay(DURATION_TASK_DELAY_MS);
       }
     }
   }
@@ -476,9 +492,6 @@ void AudioPipeline::resample_task_(void *params) {
                              EventGroupBits::RESAMPLER_MESSAGE_ERROR | EventGroupBits::PIPELINE_COMMAND_STOP);
           break;
         }
-
-        // Block to give other tasks opportunity to run
-        delay(DURATION_TASK_DELAY_MS);
       }
     }
   }

@@ -13,6 +13,22 @@
 namespace esphome {
 namespace nabu_microphone {
 
+enum class TaskEventType : uint8_t {
+  STARTING = 0,
+  STARTED,
+  RUNNING,
+  IDLE,
+  STOPPING,
+  STOPPED,
+  MUTED,
+  WARNING = 255,
+};
+
+struct TaskEvent {
+  TaskEventType type;
+  esp_err_t err;
+};
+
 class NabuMicrophoneChannel;
 
 class NabuMicrophone : public i2s_audio::I2SAudioIn, public Component {
@@ -23,10 +39,9 @@ class NabuMicrophone : public i2s_audio::I2SAudioIn, public Component {
 
   void loop() override;
 
-  // size_t read(int16_t *buf, size_t len) override;
-  // size_t read_secondary(int16_t *buf, size_t len) override;
+  void mute();
+  void unmute();
 
-  // size_t available_secondary() override { return this->comm_ring_buffer_->available(); }
   void set_channel_1(NabuMicrophoneChannel *microphone) { this->channel_1_ = microphone; }
   void set_channel_2(NabuMicrophoneChannel *microphone) { this->channel_2_ = microphone; }
 
@@ -37,6 +52,7 @@ class NabuMicrophone : public i2s_audio::I2SAudioIn, public Component {
   }
 #endif
 
+  void set_i2s_mode(i2s_mode_t mode) { this->i2s_mode_ = mode; }
   void set_sample_rate(uint32_t sample_rate) { this->sample_rate_ = sample_rate; }
   void set_bits_per_sample(i2s_bits_per_sample_t bits_per_sample) { this->bits_per_sample_ = bits_per_sample; }
   void set_use_apll(uint32_t use_apll) { this->use_apll_ = use_apll; }
@@ -71,6 +87,7 @@ class NabuMicrophone : public i2s_audio::I2SAudioIn, public Component {
 
   i2s_bits_per_sample_t bits_per_sample_;
   i2s_channel_fmt_t channel_;
+  i2s_mode_t i2s_mode_{};
   uint32_t sample_rate_;
 };
 
@@ -78,15 +95,31 @@ class NabuMicrophoneChannel : public microphone::Microphone, public Component {
  public:
   void setup() override;
 
-  void start() override { this->parent_->start(); }
+  void start() override {
+    this->parent_->start();
+    this->is_muted_ = false;
+    this->requested_stop_ = false;
+  }
 
   void set_parent(NabuMicrophone *nabu_microphone) { this->parent_ = nabu_microphone; }
 
-  void stop() override {};
+  void stop() override {
+    this->requested_stop_ = true;
+    this->is_muted_ = true;  // Mute until it is actually stopped
+  };
+
   void loop() override;
 
-  size_t read(int16_t *buf, size_t len) override { return this->ring_buffer_->read((void *) buf, len, 0); };
-  size_t available() override { return this->ring_buffer_->available(); }
+  void set_mute_state(bool mute_state) override { this->is_muted_ = mute_state; }
+  bool get_mute_state() { return this->is_muted_; }
+
+  // void set_requested_stop() { this->requested_stop_ = true; }
+  bool get_requested_stop() { return this->requested_stop_; }
+
+  size_t read(int16_t *buf, size_t len, TickType_t ticks_to_wait = 0) override {
+    return this->ring_buffer_->read((void *) buf, len, ticks_to_wait);
+  };
+  size_t read(int16_t *buf, size_t len) override { return this->ring_buffer_->read((void *) buf, len); };
   void reset() override { this->ring_buffer_->reset(); }
 
   RingBuffer *get_ring_buffer() { return this->ring_buffer_.get(); }
@@ -99,6 +132,8 @@ class NabuMicrophoneChannel : public microphone::Microphone, public Component {
   std::unique_ptr<RingBuffer> ring_buffer_;
 
   bool amplify_;
+  bool is_muted_;
+  bool requested_stop_;
 };
 
 }  // namespace nabu_microphone
